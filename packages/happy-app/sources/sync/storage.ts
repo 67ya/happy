@@ -91,6 +91,9 @@ export interface SessionRowData {
     // and activeAt updates on every heartbeat, causing needless deep-equal diffs
     activeAt?: number;
     createdAt?: number;
+    // Conversation activity timestamp used to order active project groups.
+    // Unlike activeAt, this only changes when the session record is updated.
+    updatedAt: number;
     hasDraft: boolean;
     active: boolean;
     machineId: string | null;
@@ -124,6 +127,7 @@ function buildSessionRowData(session: Session, unreadSessionIds?: Set<string>): 
         flavor: session.metadata?.flavor ?? null,
         state,
         ...(!session.active && { activeAt: session.activeAt, createdAt: session.createdAt }),
+        updatedAt: session.updatedAt,
         hasDraft: !!session.draft,
         active: session.active,
         machineId: session.metadata?.machineId ?? null,
