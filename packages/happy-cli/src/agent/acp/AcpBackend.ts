@@ -6,7 +6,7 @@
  * error handling) is delegated to TransportHandler implementations.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
 import {
   ClientSideConnection,
@@ -314,10 +314,27 @@ async function withRetry<T>(
 /**
  * ACP backend using the official @agentclientprotocol/sdk
  */
+function killProcessTree(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (process.platform === 'win32') {
+      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());
+      return;
+    }
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+    resolve();
+  });
+}
+
 export class AcpBackend implements AgentBackend {
   private listeners: AgentMessageHandler[] = [];
   private process: ChildProcess | null = null;
   private connection: ClientSideConnection | null = null;
+  /** Bumped whenever a new agent process is spawned so a killed process cannot stop the session. */
+  private spawnEpoch = 0;
+  private grokCancelRequested = false;
+  private restartPromise: Promise<void> | null = null;
+  private rejectInFlightPrompt: ((error: Error) => void) | null = null;
+  lastPromptStopReason: 'completed' | 'cancelled' | null = null;
   private acpSessionId: string | null = null;
   private disposed = false;
   /** Track active tool calls to prevent duplicate events */
@@ -387,6 +404,7 @@ export class AcpBackend implements AgentBackend {
       
       // On Windows, spawn via cmd.exe to handle .cmd files and PATH resolution
       // This ensures proper stdio piping without shell buffering
+      const spawnEpoch = ++this.spawnEpoch;
       if (process.platform === 'win32') {
         const fullCommand = [this.options.command, ...args].join(' ');
         this.process = spawn('cmd.exe', ['/c', fullCommand], {
@@ -465,6 +483,7 @@ export class AcpBackend implements AgentBackend {
       });
 
       this.process.on('error', (err) => {
+        if (spawnEpoch !== this.spawnEpoch) return;
         signalStartupFailure(err);
         // Log to file only, not console
         logger.debug(`[AcpBackend] Process error:`, err);
@@ -473,6 +492,7 @@ export class AcpBackend implements AgentBackend {
       });
 
       this.process.on('exit', (code, signal) => {
+        if (spawnEpoch !== this.spawnEpoch) return;
         if (!this.disposed && code !== 0 && code !== null) {
           signalStartupFailure(new Error(`Exit code: ${code}`));
           logger.debug(`[AcpBackend] Process exited with code ${code}, signal ${signal}`);
@@ -1056,8 +1076,14 @@ export class AcpBackend implements AgentBackend {
       throw new Error('Session not started');
     }
 
+    if (this.restartPromise) {
+      await this.restartPromise;
+    }
+
     this.emit({ type: 'status', status: 'running' });
     this.waitingForResponse = true;
+    this.grokCancelRequested = false;
+    this.lastPromptStopReason = null;
 
     try {
       logger.debug(`[AcpBackend] Sending prompt (length: ${prompt.length}): ${prompt.substring(0, 100)}...`);
@@ -1074,7 +1100,18 @@ export class AcpBackend implements AgentBackend {
       };
 
       logger.debug(`[AcpBackend] Prompt request:`, JSON.stringify(promptRequest, null, 2));
-      await this.connection.prompt(promptRequest);
+      let promptSettled = false;
+      const interrupted = new Promise<never>((_, reject) => {
+        this.rejectInFlightPrompt = (error: Error) => {
+          if (!promptSettled) reject(error);
+        };
+      });
+      try {
+        await Promise.race([this.connection.prompt(promptRequest), interrupted]);
+      } finally {
+        promptSettled = true;
+        this.rejectInFlightPrompt = null;
+      }
       logger.debug('[AcpBackend] Prompt request sent to ACP connection');
       
       // Don't emit 'idle' here - it will be emitted after all message chunks are received
@@ -1083,6 +1120,10 @@ export class AcpBackend implements AgentBackend {
     } catch (error) {
       logger.debug('[AcpBackend] Error sending prompt:', error);
       this.waitingForResponse = false;
+      if (this.options.agentName === 'grok' && this.grokCancelRequested) {
+        this.finishCancelledPrompt();
+        return;
+      }
       
       // Extract error details for better error handling
       let errorDetail: string;
@@ -1237,14 +1278,82 @@ export class AcpBackend implements AgentBackend {
     }
   }
 
+  private finishCancelledPrompt(): void {
+    this.waitingForResponse = false;
+    this.lastPromptStopReason = 'cancelled';
+    this.emitIdleStatus();
+  }
+
+  isPromptInFlight(): boolean {
+    return this.waitingForResponse;
+  }
+
+  /**
+   * Replace the agent process after an interrupt that did not settle.
+   * The Happy session stays up; the next prompt waits until the new process is ready.
+   */
+  async forceRestart(): Promise<{ restarted: boolean }> {
+    if (this.restartPromise) {
+      await this.restartPromise;
+      return { restarted: !this.disposed && this.connection !== null };
+    }
+
+    let finished!: () => void;
+    const pending = new Promise<void>((resolve) => { finished = resolve; });
+    this.restartPromise = pending;
+    const previous = this.process;
+    const pid = previous?.pid;
+    this.spawnEpoch += 1;
+    try {
+      if (pid) {
+        await killProcessTree(pid);
+        await new Promise<void>((resolve) => {
+          if (!previous || previous.exitCode !== null) {
+            resolve();
+            return;
+          }
+          const timer = setTimeout(resolve, 2000);
+          previous.once('exit', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      this.connection = null;
+      this.process = null;
+      this.activeToolCalls.clear();
+      for (const timeout of this.toolCallTimeouts.values()) clearTimeout(timeout);
+      this.toolCallTimeouts.clear();
+      this.grokCancelRequested = true;
+      this.rejectInFlightPrompt?.(new Error('Grok process restarted after interrupt'));
+      await this.startSession();
+      logger.debug(`[AcpBackend] Force-restarted ACP session ${this.acpSessionId ?? ''}`);
+      return { restarted: true };
+    } catch (error) {
+      logger.debug('[AcpBackend] Force restart failed:', error);
+      this.emit({
+        type: 'status',
+        status: 'error',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+      return { restarted: false };
+    } finally {
+      finished();
+      this.restartPromise = null;
+    }
+  }
+
   async cancel(sessionId: SessionId): Promise<void> {
     if (!this.connection || !this.acpSessionId) {
       return;
     }
 
     try {
+      if (this.options.agentName === 'grok') this.grokCancelRequested = true;
       await this.connection.cancel({ sessionId: this.acpSessionId });
-      this.emit({ type: 'status', status: 'stopped', detail: 'Cancelled by user' });
+      if (this.options.agentName !== 'grok') {
+        this.emit({ type: 'status', status: 'stopped', detail: 'Cancelled by user' });
+      }
     } catch (error) {
       // Log to file only, not console
       logger.debug('[AcpBackend] Error cancelling:', error);

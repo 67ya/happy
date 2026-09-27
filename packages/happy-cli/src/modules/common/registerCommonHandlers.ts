@@ -1,6 +1,5 @@
 import { logger } from '@/ui/logger';
-import { exec, ExecOptions } from 'child_process';
-import { promisify } from 'util';
+import { exec, execFile, type ChildProcess, type ExecOptions } from 'child_process';
 import { readFile, writeFile, readdir, stat } from 'fs/promises';
 import { createHash } from 'crypto';
 import { join } from 'path';
@@ -9,7 +8,44 @@ import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
 
-const execAsync = promisify(exec);
+const activeShellChildren = new Set<ChildProcess>();
+
+/** Stop shell commands that are still running after the user interrupts a turn. */
+export function abortActiveShellCommands(): void {
+    for (const child of activeShellChildren) {
+        activeShellChildren.delete(child);
+        const pid = child.pid;
+        if (!pid) continue;
+        if (process.platform === 'win32') {
+            execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {});
+        } else {
+            try { child.kill('SIGKILL'); } catch { /* already exited */ }
+        }
+    }
+}
+
+function asShellText(value: string | Buffer): string {
+    return typeof value === 'string' ? value : value.toString();
+}
+
+function trackExec(command: string, options: ExecOptions): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        const child = exec(command, options, (error, stdout, stderr) => {
+            activeShellChildren.delete(child);
+            const out = asShellText(stdout);
+            const err = asShellText(stderr);
+            if (error) {
+                const execError = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string };
+                execError.stdout = out;
+                execError.stderr = err;
+                reject(execError);
+                return;
+            }
+            resolve({ stdout: out, stderr: err });
+        });
+        activeShellChildren.add(child);
+    });
+}
 
 interface BashRequest {
     command: string;
@@ -173,7 +209,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             };
 
             logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
-            const { stdout, stderr } = await execAsync(data.command, options);
+            const { stdout, stderr } = await trackExec(data.command, options);
             logger.debug('Shell command executed, processing result...');
 
             const result = {
@@ -196,6 +232,16 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 code?: number | string;
                 killed?: boolean;
             };
+
+            if (execError.killed && execError.code !== 'ETIMEDOUT') {
+                return {
+                    success: false,
+                    stdout: execError.stdout || '',
+                    stderr: execError.stderr || '',
+                    exitCode: typeof execError.code === 'number' ? execError.code : -1,
+                    error: 'Command aborted'
+                };
+            }
 
             // Check if the error was due to timeout
             if (execError.code === 'ETIMEDOUT' || execError.killed) {

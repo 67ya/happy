@@ -17,6 +17,7 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { encodeBase64 } from '@/api/encryption';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
+import { abortActiveShellCommands } from '@/modules/common/registerCommonHandlers';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { projectPath } from '@/projectPath';
 import { BasePermissionHandler, type PermissionResult } from '@/utils/BasePermissionHandler';
@@ -856,6 +857,15 @@ export async function runAcp(opts: {
     session.keepAlive(thinking, 'remote');
   }, 2000);
 
+  async function waitForPromptToSettle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (backend.isPromptInFlight()) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return true;
+  }
+
   async function handleAbort() {
     try {
       if (acpSessionId) {
@@ -863,6 +873,14 @@ export async function runAcp(opts: {
       }
       permissionHandler.reset();
       abortController.abort();
+      if (opts.agentName === 'grok' && backend.isPromptInFlight()) {
+        const settled = await waitForPromptToSettle(3000);
+        if (!settled) {
+          logger.warn('[grok] interrupt did not settle turn in 3000ms; force-restarting grok');
+          abortActiveShellCommands();
+          await backend.forceRestart();
+        }
+      }
     } catch (error) {
       logger.debug(`[${opts.agentName}] Abort failed:`, error);
     } finally {
@@ -922,7 +940,10 @@ export async function runAcp(opts: {
         }
         await backend.sendPrompt(acpSessionId, batch.message);
         await turnEnded;
-        sendEnvelopes(sessionManager.endTurn('completed'));
+        const turnStatus = opts.agentName === 'grok' && backend.lastPromptStopReason === 'cancelled'
+          ? 'cancelled'
+          : 'completed';
+        sendEnvelopes(sessionManager.endTurn(turnStatus));
         session.sendSessionEvent({ type: 'ready' });
         if (verbose) {
           logAcp('muted', `Outgoing prompt completion from ${opts.agentName}`);
